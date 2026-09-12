@@ -1,0 +1,49 @@
+# UnifiedQuotientEquivariantGNN (U0 scalar) — JARVIS Bandgap
+# Model: 128x0e scalar-only on Wyckoff quotient graph (697K params)
+# Protocol: MATCHED to cogn_0e_bandgap.yaml for fair comparison
+# - 800 epochs, lr=5e-4, seed=2, patience=0 (no early stopping)
+# - apply_reference_init() for Keras-compatible init
+
+dataset: jarvis_leaderboard
+task: optb88vdw_bandgap
+property_name: optb88vdw_bandgap
+property_type: graph_scalar_intensive
+
+manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_bandgap
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+model_type: unified_quotient_equivariant
+hidden_irreps: "128x0e"
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+epochs: 800
+lr: 5e-4
+lr_stop: 1e-5
+lr_power: 1.0
+weight_decay: 1.0e-5
+loss: mae
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+patience: 0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 100
+seed: 2
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

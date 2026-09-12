@@ -1,0 +1,28 @@
+# Requirements for WyckoffGNN
+# Install: pip install -r requirements.txt
+# Or clone from existing wyckoff_vae env: conda create -n wyckoff_gnn --clone wyckoff_vae
+
+torch>=2.5.0
+torch-geometric>=2.6.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+torch-cluster>=1.6.0
+e3nn>=0.5.0
+pymatgen>=2024.0.0
+pyxtal>=1.0.0
+spglib>=2.5.0
+numpy>=1.24.0
+pandas>=2.0.0
+pytorch-lightning>=2.0.0
+wandb>=0.15.0
+pyyaml>=6.0
+tqdm>=4.65.0
+scikit-learn>=1.3.0
+lmdb>=1.4.0
+msgpack>=1.0.0
+
+# --- Optional: Matbench benchmark suite ---
+# NOTE: install these with --no-deps to avoid old scikit-learn requirement:
+#   pip install matbench matminer --no-deps
+matbench>=0.6
+matminer>=0.9

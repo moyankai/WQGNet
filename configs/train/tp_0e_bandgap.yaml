@@ -1,0 +1,48 @@
+# WyckoffTP0e — JARVIS Bandgap (Control Experiment)
+# Model: WyckoffGNN TP operator restricted to pure scalar (160x0e, ~671K params)
+# Purpose: Distinguish graph effect from operator effect vs cogn_0e
+# Scheduler: polynomial decay (matches coGN exact for fair comparison)
+
+dataset: jarvis_leaderboard
+task: optb88vdw_bandgap
+property_name: optb88vdw_bandgap
+property_type: graph_scalar_intensive
+
+manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_bandgap
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+model_type: wyckoff_gnn
+hidden_irreps: "160x0e"
+num_layers: 4
+edge_dim: 32
+use_edge_state: false
+edge_readout: false
+
+epochs: 800
+lr: 5e-4
+lr_stop: 1e-5
+lr_power: 1.0
+weight_decay: 1.0e-5
+loss: mae
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 100
+seed: 0
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

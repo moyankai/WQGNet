@@ -1,0 +1,552 @@
+"""Part 2: Quotient-vs-P1-view equivalence (Table 1 rows 2, 3, 4).
+
+Tests the load-bearing claim of the paper: the Wyckoff quotient graph
+forward pass reproduces the matched full-atom (P1-view) reference under
+shared weights.
+
+Part 2a — Layerwise hidden state equivalence (row 2):
+  For each layer t, compare h_quotient[p] vs h_P1[i] where atom i
+  belongs to orbit p. Must match up to floating-point noise.
+
+Part 2b — Output equivalence (row 3):
+  |f_quotient - f_P1| must vanish.
+
+Part 2c — Gradient equivalence (row 4):
+  ||grad_quotient - grad_P1|| must vanish for shared parameters.
+
+Reference equations:
+  - eq:quotient_p1_equivalence (main.tex)
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Tuple
+
+from .canonical_structures import CANONICAL_STRUCTURES, EXPECTED_SG
+from .shared_utils import (
+    build_quotient_graph,
+    build_p1_view,
+    load_paper_config,
+)
+
+
+def _create_shared_encoder():
+    """Create encoder in float32 mode."""
+    from wyckoff_gnn.models.legacy_v2.e3nn_encoder import EquivariantWyckoffGNNEncoder
+
+    config = load_paper_config()
+    encoder = EquivariantWyckoffGNNEncoder(
+        num_layers=config["num_layers"],
+        num_rbf=config["num_rbf"],
+        rbf_max=config["cutoff"],
+        init_irreps=config["init_irreps"],
+        hidden_irreps=config["hidden_irreps"],
+        tp_mode=config["tp_mode"],
+        radial_mlp_width=config["radial_mlp_width"],
+        use_edge_state=config["use_edge_state"],
+        edge_state_dim=config["edge_state_dim"],
+        edge_state_layers=config["edge_state_layers"],
+        edge_readout=config["edge_readout"],
+        edge_pool_mode=config["edge_pool_mode"],
+        dropout=0.0,
+        use_site_projection=config["use_site_projection"],
+    )
+    encoder.eval()
+    return encoder
+
+
+def _cast_data_float32(data):
+    for key in list(data.keys()):
+        val = data[key]
+        if isinstance(val, torch.Tensor) and val.is_floating_point():
+            data[key] = val.float()
+    return data
+
+
+def _capture_hidden_states(encoder, data):
+    """Run forward pass and capture per-layer hidden states.
+
+    Returns:
+        states: dict mapping layer_name -> (num_nodes, dim) tensor.
+        output: scalar graph-level output.
+    """
+    states = {}
+
+    def make_hook(name):
+        def hook(module, input, output):
+            if isinstance(output, tuple):
+                states[name] = output[0].detach().clone()
+            else:
+                states[name] = output.detach().clone()
+        return hook
+
+    hooks = []
+    hooks.append(
+        encoder.node_encoder.register_forward_hook(make_hook("h_init"))
+    )
+    hooks.append(
+        encoder.expand.register_forward_hook(make_hook("h_after_expand"))
+    )
+    for i, layer in enumerate(encoder.layers):
+        hooks.append(
+            layer.register_forward_hook(make_hook(f"h_layer_{i}"))
+        )
+
+    output = encoder(data)
+    states["output"] = output.detach().clone()
+
+    for h in hooks:
+        h.remove()
+
+    return states, output
+
+
+def _compute_atom_image_idx(
+    data_p1,
+    data_q,
+    atom_to_orbit: np.ndarray,
+) -> np.ndarray:
+    """Determine which image index each P1 atom corresponds to.
+
+    Matches P1 atom positions to quotient orbit images via
+    pos_i = W[p,k] @ rep[p] + w[p,k] (mod 1).
+    """
+    M = data_p1.num_nodes
+    atom_image_idx = np.zeros(M, dtype=np.int64)
+    W_frac = data_q.orbit_sym_ops_W_frac
+    w_frac = data_q.orbit_sym_ops_w_frac
+    rep_frac = data_q.orbit_rep_frac
+    mult = data_q.multiplicity
+
+    for i in range(M):
+        p = atom_to_orbit[i]
+        pos_i = data_p1.orbit_rep_frac[i].detach().cpu().numpy()
+        for k in range(int(mult[p].item())):
+            W = W_frac[p, k].detach().cpu().numpy()
+            w = w_frac[p, k].detach().cpu().numpy()
+            expected = (W @ rep_frac[p].detach().cpu().numpy() + w) % 1.0
+            diff = pos_i - expected
+            diff = diff - np.round(diff)
+            if np.max(np.abs(diff)) < 1e-5:
+                atom_image_idx[i] = k
+                break
+    return atom_image_idx
+
+
+def _build_wigner_D(
+    R_e3nn: torch.Tensor,
+    irreps: "o3.Irreps",
+) -> torch.Tensor:
+    """Build the full Wigner-D block-diagonal matrix for given irreps.
+
+    Args:
+        R_e3nn: (3, 3) Cartesian rotation matrix.
+        irreps: e3nn Irreps describing the feature layout.
+
+    Returns:
+        (dim, dim) block-diagonal D matrix.
+    """
+    from e3nn import o3
+
+    blocks = []
+    for mul, ir in irreps:
+        D_ir = ir.D_from_matrix(R_e3nn).squeeze(0)
+        for _ in range(mul):
+            blocks.append(D_ir)
+    return torch.block_diag(*blocks)
+
+
+def _get_layer_irreps(dim: int, encoder) -> "o3.Irreps":
+    """Determine the Irreps for a layer given its feature dimension."""
+    from e3nn import o3
+
+    init_dim = encoder._irreps_node_init.dim
+    if dim == init_dim:
+        return encoder._irreps_node_init
+    return o3.Irreps(str(encoder.expand.irreps_out))
+
+
+def _compare_layerwise_states(
+    states_q: dict,
+    states_p1: dict,
+    atom_to_orbit: np.ndarray,
+    atom_image_idx: np.ndarray,
+    K_quotient: int,
+    data_q,
+    data_p1,
+    encoder,
+) -> Dict:
+    """Compare layerwise hidden states using the equivariant formula.
+
+    Cross-view: h_P1[atom i] ≈ D(g_{p,k}) h_quotient[p]
+    where p = atom_to_orbit[i], k = atom_image_idx[i].
+
+    Within-orbit: h_P1[atom i] ≈ D(g_{p,k}) h_P1[atom_0]
+    where atom_0 is the first atom (image 0) in orbit p.
+
+    Returns per-layer max errors.
+    """
+    from e3nn import o3
+
+    lat = data_q.orbit_sym_ops_W_frac.device
+    A = data_q.lattice
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+    A = A[0] if A.shape[0] > 0 else A
+    A_T = A.T
+    A_inv_T = torch.inverse(A).T
+
+    results = {}
+
+    for layer_name in states_q:
+        if layer_name == "output":
+            continue
+
+        h_q = states_q[layer_name]
+        h_p1 = states_p1[layer_name]
+        dim = h_q.shape[1]
+
+        if h_q.shape[0] != K_quotient:
+            results[layer_name] = {
+                "max_within_orbit_err": float("nan"),
+                "max_cross_view_err": float("nan"),
+                "note": "node count mismatch",
+            }
+            continue
+
+        layer_irreps = _get_layer_irreps(dim, encoder)
+
+        max_within_orbit_err = 0.0
+        max_cross_view_err = 0.0
+
+        for p in range(K_quotient):
+            atom_indices = np.where(atom_to_orbit == p)[0]
+            if len(atom_indices) == 0:
+                continue
+
+            # Within-orbit: h_p1[i] vs D(g_{p,k}) h_p1[atom_0]
+            atom_0 = atom_indices[0]
+            for i in atom_indices[1:]:
+                k = atom_image_idx[i]
+                W = data_q.orbit_sym_ops_W_frac[p, k].float()
+                R_e3nn = A_T @ W.float() @ A_inv_T.float()
+                D = _build_wigner_D(R_e3nn, layer_irreps).to(h_p1.device)
+                h_rot = (D @ h_p1[atom_0].unsqueeze(1)).squeeze(1)
+                within_err = float(torch.max(torch.abs(h_p1[i] - h_rot)))
+                max_within_orbit_err = max(max_within_orbit_err, within_err)
+
+            # Cross-view: h_p1[i] vs D(g_{p,k}) h_q[p]
+            for i in atom_indices:
+                k = atom_image_idx[i]
+                W = data_q.orbit_sym_ops_W_frac[p, k].float()
+                R_e3nn = A_T @ W.float() @ A_inv_T.float()
+                D = _build_wigner_D(R_e3nn, layer_irreps).to(h_q.device)
+                h_q_rot = (D @ h_q[p].unsqueeze(1)).squeeze(1)
+                cross_err = float(torch.max(torch.abs(h_p1[i] - h_q_rot)))
+                max_cross_view_err = max(max_cross_view_err, cross_err)
+
+        results[layer_name] = {
+            "max_within_orbit_err": max_within_orbit_err,
+            "max_cross_view_err": max_cross_view_err,
+        }
+
+    return results
+
+
+def _compare_gradients(
+    encoder, data_q, data_p1, atom_to_orbit: np.ndarray,
+) -> Dict:
+    """Compare gradients from quotient vs P1 forward passes.
+
+    Runs forward pass on both views, computes grad of output w.r.t.
+    shared parameters, and compares.
+
+    Returns max gradient difference across all parameters.
+    """
+    params = list(encoder.parameters())
+
+    for p in params:
+        p.grad = None
+
+    out_q = encoder(data_q)
+    out_q.backward()
+    grads_q = [p.grad.detach().clone() if p.grad is not None
+               else torch.zeros_like(p) for p in params]
+
+    for p in params:
+        p.grad = None
+
+    out_p1 = encoder(data_p1)
+    out_p1.backward()
+    grads_p1 = [p.grad.detach().clone() if p.grad is not None
+                else torch.zeros_like(p) for p in params]
+
+    max_grad_err = 0.0
+    per_param_errors = []
+    for i, (gq, gp) in enumerate(zip(grads_q, grads_p1)):
+        err = float(torch.max(torch.abs(gq - gp)))
+        max_grad_err = max(max_grad_err, err)
+        if err > 1e-8:
+            per_param_errors.append({
+                "param_idx": i,
+                "shape": list(gq.shape),
+                "max_err": err,
+            })
+
+    return {
+        "max_grad_err": max_grad_err,
+        "n_params_with_err_gt_1e8": len(per_param_errors),
+        "total_params": len(params),
+    }
+
+
+def run_part2(
+    cutoff: float = 5.0,
+    benchmark_limit: int = 0,
+    benchmark_shard_dir: str = "",
+    benchmark_manifest: str = "",
+) -> Dict:
+    """Run Part 2: quotient vs P1-view equivalence.
+
+    Returns dict with:
+      - layerwise_max: max cross-view error across all layers and structures
+      - output_max: max |f_q - f_p1| across structures
+      - gradient_max: max gradient difference
+      - per_structure: detailed breakdown
+    """
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+
+    encoder = _create_shared_encoder()
+    encoder.eval()
+
+    global_layerwise_max = 0.0
+    global_output_max = 0.0
+    global_gradient_max = 0.0
+    per_structure = []
+
+    structures = {name: factory() for name, factory in CANONICAL_STRUCTURES.items()}
+
+    for name, struct in structures.items():
+        try:
+            data_q, orbits_q, meta_q = build_quotient_graph(struct, cutoff)
+            data_p1, orbits_p1, meta_p1 = build_p1_view(
+                struct, cutoff,
+                standardized_lattice=meta_q.get("standardized_lattice"),
+                standardized_positions=meta_q.get("standardized_positions"),
+                standardized_numbers=meta_q.get("standardized_numbers"),
+            )
+        except Exception as e:
+            per_structure.append({
+                "structure": name, "error": str(e),
+            })
+            continue
+
+        atom_to_orbit = meta_q.get("atom_to_orbit")
+        if atom_to_orbit is None:
+            per_structure.append({
+                "structure": name, "error": "no atom_to_orbit in meta",
+            })
+            continue
+
+        atom_to_orbit = np.array(atom_to_orbit, dtype=np.int64)
+        K_q = data_q.num_nodes
+
+        atom_image_idx = _compute_atom_image_idx(data_p1, data_q, atom_to_orbit)
+
+        data_q = _cast_data_float32(data_q)
+        data_p1 = _cast_data_float32(data_p1)
+
+        states_q, out_q = _capture_hidden_states(encoder, data_q)
+        states_p1, out_p1 = _capture_hidden_states(encoder, data_p1)
+
+        output_err = float(torch.abs(out_q - out_p1).max())
+        global_output_max = max(global_output_max, output_err)
+
+        layer_results = _compare_layerwise_states(
+            states_q, states_p1, atom_to_orbit, atom_image_idx,
+            K_q, data_q, data_p1, encoder,
+        )
+        for lr in layer_results.values():
+            if "max_cross_view_err" in lr:
+                global_layerwise_max = max(
+                    global_layerwise_max, lr["max_cross_view_err"]
+                )
+
+        grad_results = _compare_gradients(
+            encoder, data_q, data_p1, atom_to_orbit,
+        )
+        global_gradient_max = max(
+            global_gradient_max, grad_results["max_grad_err"]
+        )
+
+        per_structure.append({
+            "structure": name,
+            "sg": EXPECTED_SG.get(name, 0),
+            "n_quotient_nodes": K_q,
+            "n_p1_nodes": data_p1.num_nodes,
+            "output_err": output_err,
+            "layerwise": layer_results,
+            "gradient": grad_results,
+        })
+
+    result = {
+        "layerwise_max": global_layerwise_max,
+        "output_max": global_output_max,
+        "gradient_max": global_gradient_max,
+        "per_structure": per_structure,
+    }
+
+    if benchmark_limit != 0 and benchmark_shard_dir and benchmark_manifest:
+        result["benchmark"] = _run_part2_benchmark(
+            encoder, cutoff, benchmark_limit,
+            benchmark_shard_dir, benchmark_manifest,
+        )
+        global_layerwise_max = max(
+            global_layerwise_max,
+            result["benchmark"].get("layerwise_max", 0.0),
+        )
+        global_output_max = max(
+            global_output_max,
+            result["benchmark"].get("output_max", 0.0),
+        )
+        global_gradient_max = max(
+            global_gradient_max,
+            result["benchmark"].get("gradient_max", 0.0),
+        )
+        result["layerwise_max"] = global_layerwise_max
+        result["output_max"] = global_output_max
+        result["gradient_max"] = global_gradient_max
+
+    torch.set_default_dtype(prev_dtype)
+    return result
+
+
+def _expand_cached_to_p1_atoms(gd: dict):
+    """Expand cached quotient graph orbits to atom-level P1 positions.
+
+    Uses the image generators (orbit_sym_ops) stored in the cache to
+    reconstruct all atomic positions from orbit representatives.
+
+    Returns:
+        (lattice, positions, numbers, atom_to_orbit)
+    """
+    lattice = gd["lattice"]
+    orbit_rep = gd["orbit_rep_frac"]
+    orbit_element = gd["orbit_element"]
+    multiplicity = gd["multiplicity"]
+    sym_ops_W = gd["orbit_sym_ops_W_frac"]
+    sym_ops_w = gd["orbit_sym_ops_w_frac"]
+
+    K = orbit_rep.shape[0]
+    all_pos = []
+    all_nums = []
+    atom_to_orbit_list = []
+
+    for p in range(K):
+        mult = int(multiplicity[p])
+        rep = orbit_rep[p]
+        z = int(orbit_element[p])
+
+        for a in range(mult):
+            W = sym_ops_W[p, a]
+            w = sym_ops_w[p, a]
+            pos = W @ rep + w
+            pos = pos % 1.0
+            all_pos.append(pos)
+            all_nums.append(z)
+            atom_to_orbit_list.append(p)
+
+    return (
+        lattice,
+        np.array(all_pos, dtype=np.float64),
+        np.array(all_nums, dtype=np.int32),
+        np.array(atom_to_orbit_list, dtype=np.int64),
+    )
+
+
+def _run_part2_benchmark(
+    encoder,
+    cutoff: float,
+    limit: int,
+    shard_dir: str,
+    manifest_path: str,
+) -> Dict:
+    """Run Part 2 on benchmark structures from LMDB cache.
+
+    For each cached quotient graph, expands orbits to atom-level P1
+    positions and builds the P1 view via _p1_fallback + WyckoffGraphBuilder.
+    """
+    from .shared_utils import iter_benchmark_entries, build_p1_view
+    from tests.correctness_suite.part4_invariance import _build_data_from_graph_dict
+    from wyckoff_gnn.data.crystal_to_wyckoff import _atomic_number_to_symbol
+
+    global_layerwise = 0.0
+    global_output = 0.0
+    global_gradient = 0.0
+    total = 0
+    failures = 0
+
+    for gd in iter_benchmark_entries(
+        shard_dir=shard_dir,
+        manifest_path=manifest_path,
+        limit=limit,
+    ):
+        try:
+            data_q = _build_data_from_graph_dict(gd)
+            data_q = _cast_data_float32(data_q)
+
+            lat, positions, numbers, atom_to_orbit = _expand_cached_to_p1_atoms(gd)
+
+            from pymatgen.core import Structure, Lattice
+            struct = Structure(
+                Lattice(lat),
+                [_atomic_number_to_symbol(int(z)) for z in numbers],
+                positions,
+            )
+            data_p1, _, _ = build_p1_view(
+                struct, cutoff,
+                standardized_lattice=lat,
+                standardized_positions=positions,
+                standardized_numbers=numbers,
+            )
+            data_p1 = _cast_data_float32(data_p1)
+
+            K_q = data_q.num_nodes
+            atom_to_orbit = atom_to_orbit.astype(np.int64)
+            atom_image_idx = _compute_atom_image_idx(data_p1, data_q, atom_to_orbit)
+
+            states_q, out_q = _capture_hidden_states(encoder, data_q)
+            states_p1, out_p1 = _capture_hidden_states(encoder, data_p1)
+
+            output_err = float(torch.abs(out_q - out_p1).max())
+            global_output = max(global_output, output_err)
+
+            layer_results = _compare_layerwise_states(
+                states_q, states_p1, atom_to_orbit, atom_image_idx,
+                K_q, data_q, data_p1, encoder,
+            )
+            for lr in layer_results.values():
+                if "max_cross_view_err" in lr:
+                    global_layerwise = max(
+                        global_layerwise, lr["max_cross_view_err"]
+                    )
+
+            total += 1
+            if total % 1000 == 0:
+                print(f"    Part 2 benchmark: {total} structures processed")
+
+        except Exception:
+            failures += 1
+            continue
+
+    return {
+        "total_entries": total,
+        "failures": failures,
+        "layerwise_max": global_layerwise,
+        "output_max": global_output,
+        "gradient_max": global_gradient,
+    }

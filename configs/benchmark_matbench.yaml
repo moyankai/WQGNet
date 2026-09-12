@@ -1,0 +1,105 @@
+# ===========================================================================
+# Benchmark Config — Matbench v0.1 5-fold cross-validation
+# ===========================================================================
+# Default preset: matbench_mp_e_form. Switch to matbench_mp_gap via CLI
+# overrides (all task-level fields are override-friendly).
+#
+# --- Matbench MP formation energy (default) ---
+#   sbatch jobs/benchmark.slurm configs/benchmark_matbench.yaml
+#
+# --- Matbench MP band gap ---
+#   sbatch jobs/benchmark.slurm configs/benchmark_matbench.yaml --override \
+#     "benchmark.name=matbench_mp_gap_5fold" \
+#     "base.dataset=matbench_mp_gap" \
+#     "base.task=matbench_mp_gap" \
+#     "base.property_name=matbench_mp_gap" \
+#     "base.huber_delta=0.1" \
+#     "models.0.manifest_path=data/processed/matbench_mp_gap_fold0/manifest.jsonl" \
+#     "models.0.shard_dir=data/processed/matbench_mp_gap_fold0/" \
+#     "models.1.manifest_path=data/processed/matbench_mp_gap_fold1/manifest.jsonl" \
+#     "models.1.shard_dir=data/processed/matbench_mp_gap_fold1/" \
+#     "models.2.manifest_path=data/processed/matbench_mp_gap_fold2/manifest.jsonl" \
+#     "models.2.shard_dir=data/processed/matbench_mp_gap_fold2/" \
+#     "models.3.manifest_path=data/processed/matbench_mp_gap_fold3/manifest.jsonl" \
+#     "models.3.shard_dir=data/processed/matbench_mp_gap_fold3/" \
+#     "models.4.manifest_path=data/processed/matbench_mp_gap_fold4/manifest.jsonl" \
+#     "models.4.shard_dir=data/processed/matbench_mp_gap_fold4/"
+#
+# Prerequisite: preprocess all 5 folds first (see configs/preprocess.yaml).
+#
+# Aggregation:
+#   python scripts/aggregate_matbench_results.py results/bench-<name>-*
+# ===========================================================================
+
+benchmark:
+  name: matbench_mp_e_form_5fold
+  output_root: auto
+  skip_completed: true
+  fail_fast: false
+
+seeds: [0]
+
+base:
+  # --- Task / data ---
+  dataset: matbench_mp_e_form
+  task: matbench_mp_e_form
+  property_name: matbench_mp_e_form
+  property_type: graph_scalar_intensive
+  graph_type: wyckoff
+
+  # --- Model (EquivDecoder edge-dominant) ---
+  model_type:  wyckoff_edge_tp
+  init_irreps: "64x0e"
+  node_irreps: "64x0e+8x1o+8x2e"
+  edge_irreps: "16x0e+16x1o+16x2e"
+  use_site_projection: true
+#  hidden_irreps: "512x0e+16x1o" #wyckoff type mode
+  num_layers: 3
+  num_rbf: 16
+  cutoff: 5.0
+  radial_hidden: 64
+  readout_hidden: 128
+  readout_invariants: 64
+  readout_mlp_layers: 3
+  dropout: 0.2
+
+  # --- Training ---
+  epochs: 300
+  lr: 0.001
+  weight_decay: 1.0e-4
+  loss: huber
+  huber_delta: 0.05                 # override to 0.1 for matbench_mp_gap
+  grad_clip: 5.0
+  scheduler: plateau
+  patience: 80
+  ema: true
+  ema_decay: 0.999
+
+  # --- Data loading ---
+  batch_size: auto
+  val_batch_size: auto
+  num_workers: auto
+  pin_memory: auto
+  persistent_workers: auto
+  prefetch_factor: auto
+  torch_compile: auto
+  log_every_n_batches: 50
+  device: auto
+  seed: 0
+
+models:
+  - name: fold0
+    manifest_path: data/processed/matbench_mp_e_form_fold0/manifest.jsonl
+    shard_dir: data/processed/matbench_mp_e_form_fold0/
+  - name: fold1
+    manifest_path: data/processed/matbench_mp_e_form_fold1/manifest.jsonl
+    shard_dir: data/processed/matbench_mp_e_form_fold1/
+  - name: fold2
+    manifest_path: data/processed/matbench_mp_e_form_fold2/manifest.jsonl
+    shard_dir: data/processed/matbench_mp_e_form_fold2/
+  - name: fold3
+    manifest_path: data/processed/matbench_mp_e_form_fold3/manifest.jsonl
+    shard_dir: data/processed/matbench_mp_e_form_fold3/
+  - name: fold4
+    manifest_path: data/processed/matbench_mp_e_form_fold4/manifest.jsonl
+    shard_dir: data/processed/matbench_mp_e_form_fold4/

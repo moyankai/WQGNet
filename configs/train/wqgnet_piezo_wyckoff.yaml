@@ -1,0 +1,49 @@
+# WQGNet — Piezoelectric tensor (rank-3, Voigt 3x6), Wyckoff quotient graph
+# Target: piezoelectric_C_m2 from GMTNet pkl, rotated to spglib std frame.
+# Architecture matches the frozen dielectric setup; only the readout differs.
+
+dataset: jarvis_leaderboard
+task: piezoelectric_tensor
+property_name: piezoelectric_tensor
+property_type: graph_tensor
+output_type: piezo_rank3
+
+manifest_path: data/processed/gmtnet_piezo_wyckoff_stdframe/manifest.jsonl
+shard_dir: data/processed/gmtnet_piezo_wyckoff_stdframe
+graph_type: wyckoff
+
+model_type: unified_quotient_equivariant
+hidden_irreps: "128x0e + 8x1o + 4x2e"
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+tensor_point_group_projection: false          # legacy Bravais-group module, keep off
+tensor_global_point_group_projection: true    # Neumann projection of the global rank-3 output
+use_source_image_transport: true
+loss: mae
+
+epochs: 200
+patience: 0
+lr: 0.0005
+weight_decay: 1.0e-5
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 50
+seed: 2
+# Explicit dir: the auto run name omits graph_type, so the WQGNet and P1 runs
+# would otherwise collide when submitted in the same minute.
+output_dir: results/wqgnet_piezo_wyckoff_s2
+device: auto

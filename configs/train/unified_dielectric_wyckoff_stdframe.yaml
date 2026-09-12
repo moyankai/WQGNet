@@ -1,0 +1,48 @@
+# UnifiedQuotientEquivariantGNN — Dielectric Tensor (Wyckoff, stdframe v2)
+# Same as unified_dielectric_wyckoff.yaml but with tensor-frame-corrected data
+# Data: gmtnet_dielectric_wyckoff_stdframe_v2 (T_std = Q @ T_input @ Q^T)
+
+dataset: jarvis_leaderboard
+task: dielectric_tensor
+property_name: dielectric_tensor
+property_type: graph_tensor
+output_type: symmetric_rank2
+
+manifest_path: data/processed/gmtnet_dielectric_wyckoff_stdframe_v2/manifest.jsonl
+shard_dir: data/processed/gmtnet_dielectric_wyckoff_stdframe_v2
+graph_type: wyckoff
+
+model_type: unified_quotient_equivariant
+hidden_irreps: "128x0e + 8x1o + 4x2e"
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+tensor_point_group_projection: false
+use_source_image_transport: true
+loss: mae
+
+epochs: 800
+patience: 0
+lr: 0.0005
+weight_decay: 1.0e-5
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 50
+seed: 2
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

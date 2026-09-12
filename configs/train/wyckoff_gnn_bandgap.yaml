@@ -1,0 +1,61 @@
+# WyckoffGNN (Production) — JARVIS Bandgap
+# Model: O(3)-equivariant with e3nn Clebsch-Gordan tensor products
+# Params: 3.4M (hidden_irreps="512x0e+16x1o", dynamic_v2 TP + EdgeState)
+# Baseline: JARVIS bandgap test_mae=0.158, val_mae=0.115
+
+dataset: jarvis_leaderboard
+task: optb88vdw_bandgap
+property_name: optb88vdw_bandgap
+property_type: graph_scalar_intensive
+
+manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_bandgap
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+model_type: wyckoff_gnn
+init_irreps: "128x0e"
+hidden_irreps: "512x0e+16x1o"
+num_layers: 4
+num_rbf: 16
+n_bessel: 16
+cutoff: 5.0
+tp_mode: dynamic_v2
+radial_mlp_width: 32
+radial_gate_mode: per_type
+
+use_edge_state: true
+edge_state_dim: 128
+edge_state_layers: 4
+edge_readout: true
+edge_pool_mode: normalized
+
+use_site_projection: false
+
+epochs: 300
+lr: 0.001
+weight_decay: 1.0e-5
+loss: mae
+huber_delta: 0.1
+grad_clip: 5.0
+scheduler: plateau
+patience: 80
+ema: true
+ema_decay: 0.999
+dropout: 0.2
+
+batch_size: 128
+val_batch_size: 256
+num_workers: 16
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 100
+seed: 0
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

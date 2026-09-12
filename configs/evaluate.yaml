@@ -1,0 +1,61 @@
+# ===========================================================================
+# Evaluate Config — 评估训练好的 checkpoint
+# ===========================================================================
+#
+# 基本用法（推荐：直接用训练目录里的 original_config.yaml）:
+#
+#   wyckoffgnn evaluate \
+#     --config results/<run_dir>/original_config.yaml \
+#     --checkpoint results/<run_dir>/checkpoint_best.pt \
+#     --split test
+#
+# 训练中途评估（不需要等训练结束）:
+#   同上命令即可，checkpoint_best.pt 会实时更新
+#
+# 评估不同 checkpoint:
+#   checkpoint_best.pt  — 验证集最优
+#   checkpoint.pt       — 最新 epoch
+#
+# 可用模型 (model_type):
+#   wyckoff_cogn_0e              — 纯 scalar coGN (697K params)
+#   wyckoff_edge_tp              — Edge tensor product
+#   wyckoff_edge_tp_v2           — Edge TP v2 (dynamic)
+#   wyckoff_gnn                  — 原始 WyckoffGNN
+#   unified_quotient_equivariant — Unified 模型 (scalar + high-l)
+#
+# 注意：评估时 model 参数必须和训练时完全一致，所以最好直接用
+#       训练目录里的 original_config.yaml，不要手动复制参数
+#
+# ===========================================================================
+
+# --- 以下参数仅作为参考，实际评估时从 original_config.yaml 读取 ---
+
+# --- Metadata ---
+dataset: jarvis_leaderboard
+task: optb88vdw_bandgap
+property_name: optb88vdw_bandgap
+
+# --- Data paths ---
+manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_bandgap
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+# --- Model (wyckoff_cogn_0e 示例) ---
+model_type: wyckoff_cogn_0e
+hidden_dim: 128
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+# --- Data loading ---
+batch_size: auto
+num_workers: auto
+pin_memory: auto
+
+# --- Output ---
+seed: 0
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

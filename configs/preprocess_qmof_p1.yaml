@@ -1,0 +1,27 @@
+# QMOF bandgap — P1 matched baseline
+dataset:
+  adapter: cif_dir
+  adapter_kwargs:
+    cif_dir: data/mof/qmof_cifs
+    target_csv: data/mof/qmof_labels.csv
+    id_column: material_id
+    target_column: bandgap_pbe
+    split_column: split
+    recursive: false
+  split:
+    type: none
+
+graph:
+  type: p1
+  cutoff: 5.0
+  symprec: 0.1
+  angle_pair_top_k: 0
+
+preprocess:
+  cache_dir: data/processed/qmof_bandgap_p1
+  resume: true
+  max_records: null
+  skip_failed: true
+  num_workers: 28
+  chunksize: 8
+  fail_closed_splits: true

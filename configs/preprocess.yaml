@@ -1,0 +1,81 @@
+# ===========================================================================
+# Preprocess Config — raw dataset → LMDB shard cache
+# ===========================================================================
+#
+# The block below sets the JARVIS bandgap preset as default. All other tasks
+# can be launched via CLI overrides without duplicating this file.
+#
+# --- JARVIS bandgap (default) ---
+#   sbatch jobs/preprocess.slurm configs/preprocess.yaml
+#
+# --- JARVIS formation energy per atom ---
+#   sbatch jobs/preprocess.slurm configs/preprocess.yaml --override \
+#     "dataset.adapter_kwargs.target_key=formation_energy_peratom" \
+#     "preprocess.cache_dir=data/processed/jarvis_lmdb_formation_energy_peratom"
+#
+# --- Matbench MP formation energy (single fold; loop folds 0..4 for full CV) ---
+#   sbatch jobs/preprocess.slurm configs/preprocess.yaml --override \
+#     "dataset.adapter=matbench" \
+#     "dataset.adapter_kwargs.task_name=matbench_mp_e_form" \
+#     "dataset.adapter_kwargs.fold=0" \
+#     "dataset.split.type=none" \
+#     "preprocess.cache_dir=data/processed/matbench_mp_e_form_fold0"
+#
+# --- Matbench MP band gap (single fold) ---
+#   sbatch jobs/preprocess.slurm configs/preprocess.yaml --override \
+#     "dataset.adapter=matbench" \
+#     "dataset.adapter_kwargs.task_name=matbench_mp_gap" \
+#     "dataset.adapter_kwargs.fold=0" \
+#     "dataset.split.type=none" \
+#     "preprocess.cache_dir=data/processed/matbench_mp_gap_fold0"
+#
+# --- Matbench 5-fold submission helper (loop) ---
+#   for f in 0 1 2 3 4; do
+#     sbatch jobs/preprocess.slurm configs/preprocess.yaml --override \
+#       "dataset.adapter=matbench" \
+#       "dataset.adapter_kwargs.task_name=matbench_mp_e_form" \
+#       "dataset.adapter_kwargs.fold=$f" \
+#       "dataset.split.type=none" \
+#       "preprocess.cache_dir=data/processed/matbench_mp_e_form_fold$f"
+#   done
+#
+# --- Enable Phase 5 angular equivariant MP (recommend suffix cache_dir with _ang<K>) ---
+#   sbatch jobs/preprocess.slurm configs/preprocess.yaml --override \
+#     "graph.angle_pair_top_k=12" \
+#     "preprocess.cache_dir=data/processed/jarvis_lmdb_bandgap_ang12"
+#
+# ===========================================================================
+
+# --- Dataset source ---
+dataset:
+  adapter: jarvis                   # jarvis | matbench | csv | cif_dir | hamgnn_npz
+  adapter_kwargs:
+    json_path: data/jarvis_raw/jdft_3d-9-24-2025.json
+    target_key: optb88vdw_bandgap
+  split:
+    type: random                    # random | file | none
+    train_ratio: 0.8
+    val_ratio: 0.1
+    seed: 42
+
+# --- Graph builder ---
+graph:
+  type: wyckoff                     # wyckoff | atom | composition
+  cutoff: 5.0
+  symprec: 0.1
+  # Phase 5 (three-body equivariant angular MP): number of nearest
+  # incoming edges kept per target orbit as pivots to form angle pairs.
+  # 0 = disabled (default, backward-compatible; angle_pair_index is empty).
+  # 8-16 is a reasonable range. Larger = more memory during training.
+  # If you switch this ON you MUST regenerate the LMDB (data with angle_pair
+  # tensors) — old caches will train with angular MP inactive.
+  angle_pair_top_k: 0
+
+# --- Preprocess options ---
+preprocess:
+  cache_dir: data/processed/jarvis_lmdb_bandgap
+  resume: true
+  max_records: null
+  skip_failed: true
+  num_workers: 8                    # multiprocessing worker pool
+  chunksize: 16

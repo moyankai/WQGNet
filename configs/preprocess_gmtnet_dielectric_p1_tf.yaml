@@ -1,0 +1,24 @@
+# GMTNet dielectric tensor — matched P1 graph (tensor frame corrected)
+dataset:
+  adapter: gmtnet_dielectric
+  adapter_kwargs:
+    pkl_path: data/processed/gmtnet_dielectric/gmtnet_dielectric_filtered.pkl
+    split_file: data/processed/gmtnet_dielectric/split_seed32.json
+  split:
+    type: none
+
+graph:
+  type: p1
+  cutoff: 5.0
+  symprec: 1.0e-5
+  angle_pair_top_k: 0
+  rotate_tensor_to_std: true
+
+preprocess:
+  cache_dir: data/processed/gmtnet_dielectric_p1_stdframe_v2
+  resume: true
+  max_records: null
+  skip_failed: true
+  num_workers: 8
+  chunksize: 16
+  fail_closed_splits: false

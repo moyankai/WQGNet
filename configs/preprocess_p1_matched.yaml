@@ -1,0 +1,45 @@
+# ===========================================================================
+# P1 Matched Baseline Preprocess Config — standardized conventional cell
+# ===========================================================================
+#
+# Every standardized atom becomes its own orbit (K=M, multiplicity=1).
+# Uses the SAME standardized conventional cell as Wyckoff quotient.
+#
+# This is the STRICT MATCHED baseline for comparing with Wyckoff quotient.
+#
+# --- JARVIS bandgap P1 matched ---
+#   sbatch jobs/preprocess.slurm configs/preprocess_p1_matched.yaml
+#
+# --- JARVIS formation energy P1 matched ---
+#   sbatch jobs/preprocess.slurm configs/preprocess_p1_matched.yaml --override \
+#     "dataset.adapter_kwargs.target_key=formation_energy_peratom" \
+#     "preprocess.cache_dir=data/processed/jarvis_lmdb_formation_energy_peratom_p1_std"
+#
+# ===========================================================================
+
+# --- Dataset source ---
+dataset:
+  adapter: jarvis
+  adapter_kwargs:
+    json_path: data/jarvis_raw/jdft_3d-9-24-2025.json
+    target_key: optb88vdw_bandgap
+  split:
+    type: random
+    train_ratio: 0.8
+    val_ratio: 0.1
+    seed: 42
+
+# --- Graph builder ---
+graph:
+  type: p1                          # P1: every standardized atom = own orbit
+  cutoff: 5.0                       # same cutoff as Wyckoff for fair comparison
+  symprec: 0.1                      # MUST match Wyckoff builder symprec
+
+# --- Preprocess options ---
+preprocess:
+  cache_dir: data/processed/jarvis_lmdb_bandgap_p1_std  # NEW directory!
+  resume: true
+  max_records: null
+  skip_failed: true
+  num_workers: 8
+  chunksize: 16

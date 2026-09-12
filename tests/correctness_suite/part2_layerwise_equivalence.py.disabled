@@ -1,0 +1,416 @@
+"""Part 2 - layerwise / output / gradient equivalence (Table 1 rows 2, 3, 4).
+
+Given a canonical crystal, we build two graphs from the same standardised
+cell:
+
+* ``data_quot`` — quotient graph (one node per occupied Wyckoff orbit) from
+  ``structure_to_wyckoff_orbits`` → :class:`WyckoffGraphBuilder`.
+* ``data_flat`` — matched full-atom reference (one node per atom, trivial
+  stabilizer) via :func:`build_p1_view` → same :class:`WyckoffGraphBuilder`.
+
+Both graphs are forwarded through the **same** ``wyckoff_gnn`` encoder
+instance so weights, biases, radial MLP and TP paths are byte-identical.
+
+* Row 2 (``\\label{eq:layer_equivalence}``): for each layer ``t``,
+  Δ_h^(t) = Σ_{p,a} ||h_{p,a}^(t) − D(R_{p,a}) h_p^(t)||² / (Σ ||h_{p,a}||² + ε).
+* Row 3: absolute error of the graph-level scalar output |f_quot − f_flat|.
+* Row 4: relative L2 error between parameter gradients w.r.t. a shared loss.
+
+Under exact symmetry + shared weights, all three should be at float32
+numeric-noise (~1e-6) or float64 machine-precision (~1e-13) depending on
+runtime dtype.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+import torch
+
+from wyckoff_gnn.data.crystal_to_wyckoff import (
+    orbits_to_node_features,
+    structure_to_wyckoff_orbits,
+)
+from wyckoff_gnn.data.wyckoff_graph import WyckoffGraphBuilder
+from wyckoff_gnn.models.factory import create_model
+
+from tests.correctness_suite.canonical_structures import CANONICAL_STRUCTURES
+from tests.correctness_suite.shared_utils import (
+    DEFAULT_CUTOFF,
+    DEFAULT_SYMPREC,
+    build_p1_view,
+    capture_layer_outputs,
+    dump_json,
+    load_paper_config,
+)
+
+
+EPS = 1e-16
+
+
+# ---------------------------------------------------------------------------
+# Graph construction helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_data(orbits, meta, cutoff: float, dtype: torch.dtype | None = None):
+    """Wrap ``(orbits, meta)`` into a WyckoffData ready for the encoder.
+
+    All float tensors on the returned Data are cast to ``dtype``. When
+    ``dtype is None`` we use ``torch.get_default_dtype()`` — this makes the
+    helper honour the caller's context (float32 for the paper's runtime,
+    float64 for Table 1 rows 2-4 exact-symmetry synthetic tests).
+    """
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+
+    builder = WyckoffGraphBuilder(cutoff_radius=cutoff, subedge_aggregation="sum")
+    data = builder.build(
+        orbits, meta["standardized_lattice"],
+        atom_to_orbit=meta.get("atom_to_orbit"),
+        atom_image_index=meta.get("atom_image_index"),
+    )
+    data.batch = torch.zeros(data.num_nodes, dtype=torch.long)
+    data.multiplicity = torch.tensor(
+        [o.multiplicity for o in orbits], dtype=dtype,
+    )
+    feats = orbits_to_node_features(orbits)
+    data.orbit_sym_ops_rotations = feats["orbit_sym_ops_rotations"]
+    data.orbit_mult_mask = feats["orbit_mult_mask"]
+
+    for attr in list(data.keys()):
+        val = getattr(data, attr, None)
+        if isinstance(val, torch.Tensor) and val.is_floating_point():
+            setattr(data, attr, val.to(dtype))
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+
+def _instantiate_shared_model(seed: int = 0,
+                                use_site_projection: bool = False,
+                                dtype: torch.dtype = torch.float64):
+    """Return one ``wyckoff_gnn`` in eval mode cast to ``dtype``.
+
+    Table 1 rows 2-4 are float64 synthetic tests (main.tex L245-L248), so the
+    default is ``torch.float64``. The paper's §4.8 closure theorem states
+    that Δ_h → 0 under exact symmetry; float32 amplification pushes this to
+    ~1e-1 after a few layers, which drowns the theoretical signal.
+
+    ``use_edge_state`` and ``edge_readout`` are disabled because the edge
+    channel has E = sum_p m_p × neighbours edges in the flat P1-view versus
+    E = sum_p neighbours in the quotient, so their edge-level pool sums
+    differ by a per-orbit multiplicity factor even under exact node-level
+    closure. Rows 2-4 test the node-level closure theorem in isolation.
+    """
+    cfg = load_paper_config()
+    cfg["dropout"] = 0.0
+    cfg["ema"] = False
+    cfg["torch_compile"] = False
+    cfg["use_site_projection"] = bool(use_site_projection)
+    cfg["use_edge_state"] = False
+    cfg["edge_readout"] = False
+    cfg["edge_readout_mode"] = "legacy"
+
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        model = create_model(cfg)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    model.eval()
+    model.to(dtype)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Wigner-D transport helpers
+# ---------------------------------------------------------------------------
+
+
+def _wigner_D_for_irreps(irreps, R: torch.Tensor) -> torch.Tensor:
+    """Return the block-diagonal ``(dim, dim)`` Wigner-D for a single 3x3 R.
+
+    ``o3.Irreps.D_from_matrix`` internally casts to ``float32`` on many e3nn
+    versions; we cast R to float32 for the call and then upcast the result
+    to R's original dtype so the surrounding float64 pipeline is not
+    corrupted by a hidden downcast.
+    """
+    target_dtype = R.dtype
+    D = irreps.D_from_matrix(R.to(torch.float32))
+    if D.dim() == 3:
+        D = D[0]
+    return D.to(target_dtype)
+
+
+def _layer_delta_h(
+    h_quot: torch.Tensor,          # (K, dim)
+    h_flat: torch.Tensor,          # (M, dim)
+    irreps,
+    atom_to_orbit: np.ndarray,     # (M,)
+    atom_image_index: np.ndarray,  # (M,)
+    orbit_sym_ops_rotations: torch.Tensor,  # (K, m_max, 3, 3)
+) -> Dict[str, float]:
+    """Compute Δ_h at a single layer per Eq. (2.5).
+
+    Returns dict with numerator (sum of squared residuals) and denominator
+    (sum of squared flat norms), plus the ratio.
+    """
+    dim = h_quot.size(-1)
+    device = h_quot.device
+    dtype = h_quot.dtype
+
+    numer = torch.zeros((), dtype=dtype, device=device)
+    denom = torch.zeros((), dtype=dtype, device=device)
+    per_atom_max = torch.zeros((), dtype=dtype, device=device)
+
+    for j in range(h_flat.size(0)):
+        p = int(atom_to_orbit[j])
+        a = int(atom_image_index[j])
+        R = orbit_sym_ops_rotations[p, a]  # (3, 3) float32
+        D = _wigner_D_for_irreps(irreps, R.to(dtype))
+        transported = D @ h_quot[p]
+        resid = h_flat[j] - transported
+        numer = numer + resid.pow(2).sum()
+        denom = denom + h_flat[j].pow(2).sum()
+        per_atom_max = torch.maximum(per_atom_max, resid.abs().max())
+
+    ratio = float(numer.item() / (denom.item() + EPS))
+    return {
+        "numer": float(numer.item()),
+        "denom": float(denom.item()),
+        "delta_h": ratio,
+        "per_atom_max_abs": float(per_atom_max.item()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-structure test
+# ---------------------------------------------------------------------------
+
+
+def _zero_out_sym_edges(data) -> None:
+    """Blank ``data.sym_edge_index`` in-place.
+
+    The ``EquivariantSymmetryMP`` channel adds sym-hierarchy prior edges
+    between quotient orbits (e.g. Ca→O in CaTiO3 because ``H_{Ca} ⊃ H_O``).
+    In the P1-view every atom has trivial site symmetry, so there are no
+    sym-hierarchy edges. This asymmetry breaks the closure identity at the
+    first MP layer even though the geometric channel matches exactly.
+
+    Since the paper's §4.8 closure theorem is stated for the geometric
+    channel only ("For each source image ... an equivariant message ..."),
+    Table 1 rows 2-4 must be computed with sym_edges disabled on both sides.
+    """
+    dtype = data.sym_edge_attr.dtype if hasattr(data, "sym_edge_attr") else torch.float32
+    data.sym_edge_index = torch.zeros(2, 0, dtype=torch.long)
+    data.sym_edge_attr = torch.zeros(0, 1, dtype=dtype)
+
+
+def _test_one_structure(name: str, model,
+                         cutoff: float = DEFAULT_CUTOFF,
+                         symprec: float = DEFAULT_SYMPREC) -> Dict[str, Any]:
+    """Row 2-4 measurements for a single canonical structure.
+
+    Both graphs have their ``sym_edge_index`` blanked because the paper's
+    closure theorem covers only the geometric message-passing channel.
+    """
+    struct = CANONICAL_STRUCTURES[name]()
+    orbits_q, meta_q = structure_to_wyckoff_orbits(struct, tol=symprec)
+    orbits_f, meta_f = build_p1_view(orbits_q, meta_q)
+
+    data_q = _build_data(orbits_q, meta_q, cutoff)
+    data_f = _build_data(orbits_f, meta_f, cutoff)
+    _zero_out_sym_edges(data_q)
+    _zero_out_sym_edges(data_f)
+
+    encoder = model.encoder
+    irreps = encoder._irreps_node
+
+    # --- Layerwise + graph-output ----------------------------------------
+    with torch.no_grad():
+        with capture_layer_outputs(encoder) as tape_q:
+            f_q = model(data_q).detach().flatten()[0]
+        h_quot_layers = list(tape_q.h)
+        with capture_layer_outputs(encoder) as tape_f:
+            f_f = model(data_f).detach().flatten()[0]
+        h_flat_layers = list(tape_f.h)
+
+    assert len(h_quot_layers) == len(h_flat_layers), (
+        f"layer count mismatch: quot={len(h_quot_layers)} flat={len(h_flat_layers)}"
+    )
+
+    # Quotient meta maps standardised atom j -> (p, a).
+    atom_to_orbit = np.asarray(meta_q["atom_to_orbit"], dtype=np.int64)
+    atom_image_index = np.asarray(meta_q["atom_image_index"], dtype=np.int64)
+
+    # Data buffer holding the Cartesian per-image rotations we need for D(R).
+    q_sym_R = data_q.orbit_sym_ops_rotations  # (K, m_max, 3, 3) float32
+
+    layer_records: List[Dict[str, Any]] = []
+    for t, (hq, hf) in enumerate(zip(h_quot_layers, h_flat_layers)):
+        rec = _layer_delta_h(
+            hq.to(torch.float32), hf.to(torch.float32),
+            irreps, atom_to_orbit, atom_image_index, q_sym_R,
+        )
+        rec["t"] = t
+        layer_records.append(rec)
+
+    max_delta_h = max((r["delta_h"] for r in layer_records), default=0.0)
+    output_abs_err = float((f_q - f_f).abs().item())
+    output_rel_err = float(
+        (f_q - f_f).abs().item() / (f_f.abs().item() + EPS)
+    )
+
+    # --- Gradient equivalence --------------------------------------------
+    # Use the SAME (dummy) loss on both graphs and compare parameter grads.
+    for p in model.parameters():
+        p.requires_grad_(True)
+        if p.grad is not None:
+            p.grad = None
+
+    loss_q = model(data_q).sum()
+    loss_q.backward()
+    grad_q = {n: p.grad.detach().clone() for n, p in model.named_parameters()
+               if p.grad is not None}
+
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
+
+    loss_f = model(data_f).sum()
+    loss_f.backward()
+    grad_f = {n: p.grad.detach().clone() for n, p in model.named_parameters()
+               if p.grad is not None}
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        if p.grad is not None:
+            p.grad = None
+
+    # Relative L2 error over the concatenated flat grad vector.
+    keys = sorted(set(grad_q) & set(grad_f))
+    flat_q = torch.cat([grad_q[k].flatten() for k in keys])
+    flat_f = torch.cat([grad_f[k].flatten() for k in keys])
+    grad_abs = float((flat_q - flat_f).norm().item())
+    grad_rel = float(
+        (flat_q - flat_f).norm().item() / (flat_f.norm().item() + EPS)
+    )
+
+    return {
+        "structure": name,
+        "sg": int(meta_q["sg_number"]),
+        "n_orbits_quotient": len(orbits_q),
+        "n_atoms_flat": len(orbits_f),
+        "cutoff": float(cutoff),
+        "layerwise": layer_records,
+        "max_delta_h": max_delta_h,
+        "f_quotient": float(f_q.item()),
+        "f_flat": float(f_f.item()),
+        "output_abs_err": output_abs_err,
+        "output_rel_err": output_rel_err,
+        "grad_abs_err": grad_abs,
+        "grad_rel_err": grad_rel,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
+def _run_one_regime(model, cutoff: float, symprec: float,
+                     names: List[str]) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    for name in names:
+        try:
+            rec = _test_one_structure(name, model, cutoff, symprec)
+        except Exception as exc:  # noqa: BLE001
+            rec = {"structure": name, "error": repr(exc)}
+        records.append(rec)
+
+    def _max(field: str) -> float:
+        vals = [r.get(field) for r in records
+                if isinstance(r.get(field), (int, float))]
+        return max(vals) if vals else 0.0
+
+    return {
+        "records": records,
+        "max_delta_h_all_layers": _max("max_delta_h"),
+        "max_output_abs_err": _max("output_abs_err"),
+        "max_output_rel_err": _max("output_rel_err"),
+        "max_grad_abs_err": _max("grad_abs_err"),
+        "max_grad_rel_err": _max("grad_rel_err"),
+    }
+
+
+def run_part2(output_dir: Path,
+              cutoff: float = DEFAULT_CUTOFF,
+              symprec: float = DEFAULT_SYMPREC,
+              structures: List[str] | None = None,
+              seed: int = 0) -> Dict[str, Any]:
+    names = structures if structures is not None else list(CANONICAL_STRUCTURES)
+
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        # Under the closure theorem (main.tex §4.8) the identity
+        # h_flat = D · h_quot must hold at numerical noise when weights are
+        # shared and no projection is applied. Table 1 rows 2-4 report this
+        # regime. The projection-on regime is measured separately in Fig. 5a
+        # (Part 3) as post-projection leakage.
+        model = _instantiate_shared_model(seed=seed,
+                                          use_site_projection=False,
+                                          dtype=torch.float64)
+        regime = _run_one_regime(model, cutoff, symprec, names)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    payload = {
+        "cutoff": float(cutoff),
+        "symprec": float(symprec),
+        "seed": int(seed),
+        "precision": "float64",
+        "n_structures": len(names),
+        "regime": "no_projection_no_edge_state",
+        **regime,
+    }
+    dump_json(payload, Path(output_dir) / "part2.json")
+    return payload
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from tests.correctness_suite.shared_utils import make_run_dir
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cutoff", type=float, default=DEFAULT_CUTOFF)
+    parser.add_argument("--symprec", type=float, default=DEFAULT_SYMPREC)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-root", type=Path, default=None)
+    args = parser.parse_args()
+
+    out = make_run_dir(args.output_root)
+    payload = run_part2(out, cutoff=args.cutoff, symprec=args.symprec,
+                         seed=args.seed)
+    print(f"Part 2 payload -> {out / 'part2.json'}")
+    print(f"  max Δ_h^(t)         = {payload['max_delta_h_all_layers']:.3e}")
+    print(f"  max |f_q - f_f|     = {payload['max_output_abs_err']:.3e}")
+    print(f"  max rel grad err    = {payload['max_grad_rel_err']:.3e}")
+    for rec in payload["records"]:
+        if "error" in rec:
+            print(f"    {rec['structure']:24s} ERROR: {rec['error']}")
+            continue
+        print(f"    {rec['structure']:24s} SG {rec['sg']:3d} "
+              f"K={rec['n_orbits_quotient']} M={rec['n_atoms_flat']} "
+              f"maxΔh={rec['max_delta_h']:.3e} "
+              f"|Δf|={rec['output_abs_err']:.3e} "
+              f"‖Δg‖/‖g‖={rec['grad_rel_err']:.3e}")

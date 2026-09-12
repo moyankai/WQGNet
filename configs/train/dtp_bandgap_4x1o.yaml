@@ -1,0 +1,63 @@
+# DTP (new architecture): 128x0e + 4x1o on JARVIS Bandgap
+# Block type: dynamic_tp (lightweight DTP1-compatible)
+# Architecture: direct scalar→mul projection, edge-only gating
+# ~725K params (697K scalar + 28K angular)
+# Expected speed: ~49s/epoch on P100
+
+dataset: jarvis_leaderboard
+task: optb88vdw_bandgap
+property_name: optb88vdw_bandgap
+property_type: graph_scalar_intensive
+
+manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_bandgap
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+model_type: unified_quotient_equivariant
+block_type: dynamic_tp
+hidden_irreps: "128x0e + 4x1o"
+
+# Site projection (lmax8, invariant_basis)
+use_site_irrep_projection: true
+site_projector_path: data/symmetry/site_irrep_tables/invariant_basis/site_projectors_lmax8.pt
+site_irrep_lmax: 8
+apply_site_projection: each_layer
+unknown_projector_policy: identity
+missing_irrep_policy: identity
+
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+# Angular param groups
+angular_lr_factor: 0.2
+angular_weight_decay: 1.0e-3
+
+epochs: 200
+lr: 5e-4
+lr_stop: 1e-5
+lr_power: 1.0
+weight_decay: 1.0e-5
+loss: mae
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+patience: 0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 100
+seed: 2
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

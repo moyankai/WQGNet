@@ -1,0 +1,45 @@
+# U0: Scalar-only (128x0e) — 20-epoch formation energy
+# Params: 697,601
+
+dataset: jarvis_leaderboard
+task: formation_energy_peratom
+property_name: formation_energy_peratom
+property_type: graph_scalar_intensive
+
+manifest_path: data/processed/jarvis_lmdb_formation_energy_peratom/manifest.jsonl
+shard_dir: data/processed/jarvis_lmdb_formation_energy_peratom
+graph_type: wyckoff
+leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_formation_energy_peratom.json.zip
+
+model_type: unified_quotient_equivariant
+hidden_irreps: "128x0e"
+num_layers: 5
+num_rbf: 32
+rbf_max: 8.0
+
+epochs: 300
+lr: 1e-3
+lr_stop: 1e-5
+lr_power: 1.0
+weight_decay: 1.0e-5
+loss: mae
+grad_clip: 5.0
+scheduler: polynomial
+ema: false
+dropout: 0.0
+
+batch_size: 64
+val_batch_size: 128
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+torch_compile: false
+global_max_mult: 192
+
+log_every_n_batches: 100
+seed: 0
+output_dir: auto
+output_root: results
+timestamp_output: true
+device: auto

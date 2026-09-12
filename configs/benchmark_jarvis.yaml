@@ -1,0 +1,136 @@
+# ===========================================================================
+# Benchmark Config — JARVIS-Leaderboard controlled-variable sweep
+# ===========================================================================
+# Default preset: bandgap (optb88vdw_bandgap). Switch to formation energy
+# via CLI overrides (all task-level fields are override-friendly).
+#
+# --- JARVIS bandgap (default) ---
+#   sbatch jobs/benchmark.slurm configs/benchmark_jarvis.yaml
+#
+# --- JARVIS formation energy per atom ---
+#   sbatch jobs/benchmark.slurm configs/benchmark_jarvis.yaml --override \
+#     "benchmark.name=fe_ctrl_sweep" \
+#     "base.dataset=jarvis_leaderboard" \
+#     "base.task=formation_energy_peratom" \
+#     "base.property_name=formation_energy_peratom" \
+#     "base.manifest_path=data/processed/jarvis_wyckoff_lmdb_formation_energy_peratom/manifest.jsonl" \
+#     "base.shard_dir=data/processed/jarvis_wyckoff_lmdb_formation_energy_peratom" \
+#     "base.leaderboard_split_zip=data/jarvis_leaderboard/dft_3d_formation_energy_peratom.json.zip" \
+#     "base.huber_delta=0.05"
+#
+# Sweep design: 17 models = baseline_ref + 16 controlled-variable variants.
+# Sweeps A/B/C/D/E vary ONE hyperparameter at a time relative to baseline_ref.
+# ===========================================================================
+
+benchmark:
+  name: bandgap_ctrl_sweep
+  output_root: auto
+  skip_completed: true
+  fail_fast: false
+
+seeds: [0]
+
+base:
+  # --- Task / data ---
+  dataset: jarvis_leaderboard
+  task: optb88vdw_bandgap
+  property_name: optb88vdw_bandgap
+  property_type: graph_scalar_intensive
+  graph_type: wyckoff
+  manifest_path: data/processed/jarvis_lmdb_bandgap/manifest.jsonl
+  shard_dir: data/processed/jarvis_lmdb_bandgap
+  leaderboard_split_zip: data/jarvis_leaderboard/dft_3d_optb88vdw_bandgap.json.zip
+
+  # --- Model (baseline_ref) ---
+  model_type: wyckoff_edge_tp
+  init_irreps: "64x0e"
+  node_irreps: "64x0e+8x1o+8x2e"
+  edge_irreps: "16x0e+16x1o+16x2e"
+  use_site_projection: true
+  num_layers: 3
+  num_rbf: 16
+  n_bessel: 16                         # Bessel basis count for radial features (was hardcoded 8)
+  cutoff: 5.0
+  radial_hidden: 64
+  readout_hidden: 128
+  readout_invariants: 64
+  readout_mlp_layers: 3
+  dropout: 0.2
+
+  # --- Training ---
+  epochs: 300
+  lr: 0.001
+  weight_decay: 1.0e-4
+  loss: huber
+  huber_delta: 0.1                  # override to 0.05 for formation energy
+  grad_clip: 5.0
+  scheduler: plateau
+  patience: 80
+  ema: true
+  ema_decay: 0.999
+
+  # --- Data loading ---
+  batch_size: auto
+  val_batch_size: auto
+  num_workers: auto
+  pin_memory: auto
+  persistent_workers: auto
+  prefetch_factor: auto
+  torch_compile: auto
+  log_every_n_batches: 50
+  device: auto
+  seed: 0
+
+models:
+  # ===================== Reference =====================
+  - name: baseline_ref
+    # uses base defaults
+
+  # ===================== A. Sweep node_0e mul (l=1,2 fixed at 8) =====================
+  - name: node0e_16
+    node_irreps: "16x0e+8x1o+8x2e"
+  - name: node0e_32
+    node_irreps: "32x0e+8x1o+8x2e"
+  # baseline_ref covers node0e_64
+  - name: node0e_128
+    node_irreps: "128x0e+8x1o+8x2e"
+  - name: node0e_256
+    node_irreps: "256x0e+8x1o+8x2e"
+
+  # ===================== B. Sweep edge_0e mul (l=1,2 fixed at 16) =====================
+  - name: edge0e_8
+    edge_irreps: "8x0e+16x1o+16x2e"
+  # baseline_ref covers edge0e_16
+  - name: edge0e_32
+    edge_irreps: "32x0e+16x1o+16x2e"
+  - name: edge0e_64
+    edge_irreps: "64x0e+16x1o+16x2e"
+
+  # ===================== C. Sweep edge l=1,2 mul (0e fixed at 16) =====================
+  - name: edge_l_4
+    edge_irreps: "16x0e+4x1o+4x2e"
+  - name: edge_l_8
+    edge_irreps: "16x0e+8x1o+8x2e"
+  # baseline_ref covers edge_l_16
+  - name: edge_l_32
+    edge_irreps: "16x0e+32x1o+32x2e"
+
+  # ===================== D. Sweep num_layers =====================
+  - name: L2
+    num_layers: 2
+  # baseline_ref covers L3
+  - name: L4
+    num_layers: 4
+  - name: L5
+    num_layers: 5
+
+  # ===================== E. Sweep cutoff =====================
+  - name: cutoff_4
+    cutoff: 4.0
+  # baseline_ref covers cutoff_5
+  - name: cutoff_6
+    cutoff: 6.0
+    num_rbf: 24
+  - name: cutoff_8
+    cutoff: 8.0
+    num_rbf: 32
